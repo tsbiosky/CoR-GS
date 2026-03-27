@@ -100,6 +100,10 @@ class Scene:
                 pseudo_poses = generate_random_poses_360(self.train_cameras[resolution_scale])
             elif args.source_path.find('DTU') != -1:
                 pseudo_poses = generate_random_poses_llff(self.train_cameras[resolution_scale])
+            else:
+                pseudo_poses = generate_random_poses_360(
+                    self.train_cameras[resolution_scale], z_variation=0.0
+                )
 
             view = self.train_cameras[resolution_scale][0]
             self.bounds = view.bounds

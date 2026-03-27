@@ -441,15 +441,16 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         contents = json.load(json_file)
         fovx = contents["camera_angle_x"]
 
-        skip = 8 if transformsfile == 'transforms_test.json' else 1
-        frames = contents["frames"][::skip]
+        frames = contents["frames"]
+        is_opengl = contents.get("is_opengl", True)
         for idx, frame in tqdm(enumerate(frames)):
             cam_name = os.path.join(path, frame["file_path"] + extension)
 
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
-            # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
-            c2w[:3, 1:3] *= -1
+            if is_opengl:
+                # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
+                c2w[:3, 1:3] *= -1
 
             # get the world-to-camera transform and set R, T
             w2c = np.linalg.inv(c2w)
@@ -479,14 +480,8 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
             width = image.size[0]
 
             mask = norm_data[:, :, 3:4]
-            if skip == 1:
-                depth_image = None
-            else:
-                depth_image = None
 
             image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
-            depth_image = None if depth_image is None else depth_image
-            mask = None if mask is None else mask
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image, image_path=image_path,
                                         image_name=image_name, width=width, height=height, mask=mask,
@@ -508,7 +503,9 @@ def readNerfSyntheticInfo(path, white_background, eval, n_views=0, extension=".p
 
     pseudo_cam_infos = train_cam_infos #train_cam_infos
     if n_views > 0:
-        train_cam_infos = [c for idx, c in enumerate(train_cam_infos) if idx in [2, 16, 26, 55, 73, 76, 86, 93]]
+        idx_sub = np.linspace(0, len(train_cam_infos) - 1, n_views)
+        idx_sub = [round(i) for i in idx_sub]
+        train_cam_infos = [c for idx, c in enumerate(train_cam_infos) if idx in idx_sub]
         print(f"len(train_cam_infos) is {len(train_cam_infos)}")
         assert len(train_cam_infos) == n_views
 
@@ -520,12 +517,23 @@ def readNerfSyntheticInfo(path, white_background, eval, n_views=0, extension=".p
         ply_path = os.path.join(path, "points3d.ply")
         print('Init random point cloud.')
         if rand_pcd and not os.path.exists(ply_path):
-            # Since this data set has no colmap data, we start with random points
-            num_pts = 10_000
+            num_pts = 50_000
             print(f"Generating random point cloud ({num_pts})...")
-            
-            # We create random points inside the bounds of the synthetic Blender scenes
-            xyz = np.random.random((num_pts, 3)) * 2.6 - 1.3
+
+            cam_positions = []
+            for cam in train_cam_infos:
+                W2C = np.zeros((4, 4))
+                W2C[:3, :3] = cam.R.T
+                W2C[:3, 3] = cam.T
+                W2C[3, 3] = 1.0
+                C2W = np.linalg.inv(W2C)
+                cam_positions.append(C2W[:3, 3])
+            cam_positions = np.array(cam_positions)
+            center = cam_positions.mean(0)
+            extent = np.abs(cam_positions - center).max() * 1.5
+            xyz = (np.random.random((num_pts, 3)) * 2 - 1) * extent + center
+            print(f"PCD center: {center}, extent: {extent:.3f}")
+
             shs = np.random.random((num_pts, 3)) / 255.0
             pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
 
