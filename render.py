@@ -42,9 +42,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         render_pkg = render(view, gaussians, pipeline, background)
-        gt = view.original_image[0:3, :, :]
         torchvision.utils.save_image(render_pkg["render"], os.path.join(render_path, view.image_name + '.png'))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, view.image_name + ".png"))
+
+        gt = view.original_image[0:3, :, :]
+        if gt.sum() > 0:
+            torchvision.utils.save_image(gt, os.path.join(gts_path, view.image_name + ".png"))
 
         if args.render_depth:
             depth_map = vis_depth(render_pkg['depth'][0].detach().cpu().numpy())

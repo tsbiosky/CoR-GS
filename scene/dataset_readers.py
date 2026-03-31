@@ -198,7 +198,11 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder, path, rgb_m
         uid = intr.id
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
-        bounds = np.load(os.path.join(path, 'poses_bounds.npy'))[idx, -2:]
+        poses_bounds_path = os.path.join(path, 'poses_bounds.npy')
+        if os.path.exists(poses_bounds_path):
+            bounds = np.load(poses_bounds_path)[idx, -2:]
+        else:
+            bounds = np.array([0.01, 100.0])
 
         if intr.model=="SIMPLE_PINHOLE" or intr.model=="SIMPLE_RADIAL":
             focal_length_x = intr.params[0]
@@ -296,22 +300,49 @@ def readColmapSceneInfo(path, images, eval, n_views=0, llffhold=8, rand_pcd=Fals
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
         except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
-        # print(xyz.max(0), xyz.min(0))
+            try:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            except:
+                xyz = None
 
+        if xyz is None:
+            print('No existing points found, generating random PCD from camera positions.')
+            try:
+                cam_exts_file = os.path.join(path, 'sparse/0', 'images.txt')
+                cam_exts_tmp = read_extrinsics_text(cam_exts_file)
+                cam_positions = []
+                for k in cam_exts_tmp:
+                    e = cam_exts_tmp[k]
+                    R = qvec2rotmat(e.qvec)
+                    t = np.array(e.tvec)
+                    C = -R.T @ t
+                    cam_positions.append(C)
+                cam_positions = np.array(cam_positions)
+                center = cam_positions.mean(0)
+                extent = np.abs(cam_positions - center).max() * 1.5
+            except:
+                center = np.zeros(3)
+                extent = 1.0
+            num_pts = 100000
+            xyz = (np.random.random((num_pts, 3)) * 2 - 1) * extent + center
+            print(f'Generated {num_pts} random points, center={center}, extent={extent:.3f}')
 
-        
-        pcd_shape = (topk_(xyz, 1, 0)[-1] + topk_(-xyz, 1, 0)[-1])
-        num_pts = int(pcd_shape.max() * 50)
-        xyz = np.random.random((num_pts, 3)) * pcd_shape * 1.3 - topk_(-xyz, 20, 0)[-1]
-        print(pcd_shape)
-        print(f"Generating random point cloud ({num_pts})...")
+        else:
+            pcd_shape = (topk_(xyz, 1, 0)[-1] + topk_(-xyz, 1, 0)[-1])
+            num_pts = int(pcd_shape.max() * 50)
+            xyz = np.random.random((num_pts, 3)) * pcd_shape * 1.3 - topk_(-xyz, 20, 0)[-1]
+            print(pcd_shape)
+            print(f"Generating random point cloud ({num_pts})...")
 
         shs = np.random.random((num_pts, 3)) / 255.0
         pcd = BasicPointCloud(points=xyz, colors=SH2RGB(shs), normals=np.zeros((num_pts, 3)))
         storePly(ply_path, xyz, SH2RGB(shs) * 255)
     else:
         ply_path = os.path.join(path, str(n_views) + "_views/dense/fused.ply")
+        if not os.path.exists(ply_path):
+            ply_path = os.path.join(path, "sparse/0/points3D.ply")
+        bin_path = os.path.join(path, "sparse/0/points3D.bin")
+        txt_path = os.path.join(path, "sparse/0/points3D.txt")
 
     try:
         cameras_intrinsic_file = os.path.join(path, "sparse/0", "cameras.bin")
@@ -327,10 +358,17 @@ def readColmapSceneInfo(path, images, eval, n_views=0, llffhold=8, rand_pcd=Fals
 
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
+        xyz, rgb = None, None
         try:
             xyz, rgb, _ = read_points3D_binary(bin_path)
         except:
-            xyz, rgb, _ = read_points3D_text(txt_path)
+            try:
+                xyz, rgb, _ = read_points3D_text(txt_path)
+            except:
+                pass
+        if xyz is None:
+            xyz = np.zeros((1, 3), dtype=np.float32)
+            rgb = np.full((1, 3), 255, dtype=np.uint8)
         storePly(ply_path, xyz, rgb)
     try:
         pcd = fetchPly(ply_path)
@@ -442,15 +480,18 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
         fovx = contents["camera_angle_x"]
 
         frames = contents["frames"]
-        is_opengl = contents.get("is_opengl", True)
+        cam_convention = contents.get("cam_convention", "opengl")
         for idx, frame in tqdm(enumerate(frames)):
             cam_name = os.path.join(path, frame["file_path"] + extension)
 
             # NeRF 'transform_matrix' is a camera-to-world transform
             c2w = np.array(frame["transform_matrix"])
-            if is_opengl:
-                # change from OpenGL/Blender camera axes (Y up, Z back) to COLMAP (Y down, Z forward)
+            if cam_convention == "opengl":
+                # OpenGL/Blender: Y up, Z back -> COLMAP: Y down, Z forward
                 c2w[:3, 1:3] *= -1
+            elif cam_convention == "z_back":
+                # Same as OpenCV but Z points backward: only negate Z column
+                c2w[:3, 2] *= -1
 
             # get the world-to-camera transform and set R, T
             w2c = np.linalg.inv(c2w)
@@ -459,29 +500,26 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             image_path = cam_name
             image_name = Path(cam_name).stem
-            image = Image.open(image_path)
 
-            im_data = np.array(image.convert("RGBA"))
+            if os.path.exists(image_path):
+                image = Image.open(image_path)
+                im_data = np.array(image.convert("RGBA"))
+                bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
+                norm_data = im_data / 255.0
+                arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
+                image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+                mask = norm_data[:, :, 3:4]
+                width, height = image.size
+            else:
+                width, height = 1440, 1080
+                image = Image.fromarray(np.zeros((height, width, 3), dtype=np.uint8), "RGB")
+                mask = None
 
-            bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-
-            norm_data = im_data / 255.0
-            arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-            image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
-
-            fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+            fovy = focal2fov(fov2focal(fovx, width), height)
             FovY = fovy
             FovX = fovx
-
-            focal_length_x = fov2focal(fovx, image.size[0])
-            focal_length_y = fov2focal(fovy, image.size[1])
-
-            height = image.size[1]
-            width = image.size[0]
-
-            mask = norm_data[:, :, 3:4]
-
-            image = Image.fromarray(np.array(arr * 255.0, dtype=np.byte), "RGB")
+            focal_length_x = fov2focal(fovx, width)
+            focal_length_y = fov2focal(fovy, height)
 
             cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image, image_path=image_path,
                                         image_name=image_name, width=width, height=height, mask=mask,
@@ -497,11 +535,15 @@ def readNerfSyntheticInfo(path, white_background, eval, n_views=0, extension=".p
     print("Reading Test Transforms")
     test_cam_infos = readCamerasFromTransforms(path, "transforms_test.json", white_background, extension)
 
-    if not eval:
+    train_names = {c.image_name for c in train_cam_infos}
+    test_names = {c.image_name for c in test_cam_infos}
+    has_distinct_test = len(test_names - train_names) > 0
+
+    if not eval and not has_distinct_test:
         train_cam_infos.extend(test_cam_infos)
         test_cam_infos = []
 
-    pseudo_cam_infos = train_cam_infos #train_cam_infos
+    pseudo_cam_infos = train_cam_infos
     if n_views > 0:
         idx_sub = np.linspace(0, len(train_cam_infos) - 1, n_views)
         idx_sub = [round(i) for i in idx_sub]
@@ -517,7 +559,10 @@ def readNerfSyntheticInfo(path, white_background, eval, n_views=0, extension=".p
         ply_path = os.path.join(path, "points3d.ply")
         print('Init random point cloud.')
         if rand_pcd and not os.path.exists(ply_path):
-            num_pts = 50_000
+            # Keep initialization modest: create_from_pcd() immediately calls
+            # distCUDA2() on all points, which can spike GPU memory for large
+            # random clouds before training even starts.
+            num_pts = 10_000
             print(f"Generating random point cloud ({num_pts})...")
 
             cam_positions = []
