@@ -17,3 +17,7 @@ data*
 
 
 run_scripts*
+
+*.zip
+*.ply
+.DS_Store
